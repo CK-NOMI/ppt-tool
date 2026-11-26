@@ -37,19 +37,29 @@ def selection_box(raw, image):
     return (x, y, x + w, y + h)
 
 
-def ai_edit(image, box, instruction):
+def ai_edit(image, box, instruction, mode=None):
     base = os.getenv('IMAGE_API_BASE', '').rstrip('/')
     key = os.getenv('IMAGE_API_KEY', '')
     model = os.getenv('IMAGE_MODEL', 'gpt-image-2.6-sunburst')
     if not base or not key:
         raise ValueError('请先在启动环境中设置 IMAGE_API_BASE 和 IMAGE_API_KEY')
-    # The source service creates an opaque black mask with a white selected rectangle.
-    mask = Image.new('RGBA', image.size, (0, 0, 0, 255))
-    ImageDraw.Draw(mask).rectangle((box[0], box[1], box[2]-1, box[3]-1), fill=(255, 255, 255, 255))
+    mode = (mode or os.getenv('IMAGE_EDIT_MODE', 'mask')).lower()
+    fields = {'model': model, 'prompt': instruction, 'response_format': 'b64_json'}
+    if mode == 'mask':
+        mask = Image.new('RGBA', image.size, (0, 0, 0, 255))
+        ImageDraw.Draw(mask).rectangle((box[0], box[1], box[2]-1, box[3]-1), fill=(255, 255, 255, 255))
+        files = {'image': ('base.png', png_bytes(image), 'image/png'),
+                 'mask': ('mask.png', png_bytes(mask), 'image/png')}
+    elif mode == 'reference':
+        x, y, right, bottom = box
+        fields['prompt'] = (f'仅修改图片中位于坐标 (x={x}, y={y}, width={right-x}, '
+                            f'height={bottom-y}) 的区域：{instruction}。其余区域必须与原图保持完全一致，'
+                            '不要改变整体版式、字体风格与配色。')
+        files = {'image[]': ('ref_0.png', png_bytes(image), 'image/png')}
+    else:
+        raise ValueError('IMAGE_EDIT_MODE 应为 mask 或 reference')
     response = requests.post(base + '/images/edits', headers={'Authorization': 'Bearer ' + key},
-        data={'model': model, 'prompt': instruction, 'response_format': 'b64_json'},
-        files={'image': ('base.png', png_bytes(image), 'image/png'),
-               'mask': ('mask.png', png_bytes(mask), 'image/png')}, timeout=600)
+                             data=fields, files=files, timeout=600)
     if not response.ok:
         raise ValueError(f'图片服务返回 HTTP {response.status_code}')
     item = response.json()['data'][0]
@@ -63,7 +73,17 @@ def ai_edit(image, box, instruction):
         raise ValueError('图片服务没有返回图片')
     result = Image.open(io.BytesIO(raw))
     result.load()
-    return result.convert('RGBA')
+    result = result.convert('RGBA')
+    if result.size != image.size:
+        original_ratio = image.width / image.height
+        result_ratio = result.width / result.height
+        if abs(result_ratio / original_ratio - 1) > 0.01:
+            raise ValueError('图片服务返回的宽高比例与原图不一致，无法准确定位选区，请重试或更换模型')
+        result = result.resize(image.size, Image.Resampling.LANCZOS)
+    # Keep the original pixels outside the selected rectangle.
+    output = image.copy()
+    output.paste(result.crop(box), box)
+    return output
 
 
 @app.get('/')
@@ -91,7 +111,7 @@ def edit():
                 instruction = request.form.get('instruction', '').strip()
                 if not instruction:
                     raise ValueError('请输入修改要求')
-                result = ai_edit(image, box, instruction)
+                result = ai_edit(image, box, instruction, request.form.get('mode'))
             else:
                 raise ValueError('不支持的操作')
         return app.response_class(png_bytes(result), mimetype='image/png')
