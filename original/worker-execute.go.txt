@@ -1,0 +1,115 @@
+case model.TaskKindRegionEdit:
+		if project == nil {
+			return "", errors.New("项目不存在")
+		}
+		targetID := ""
+		if task.TargetSlideID != nil {
+			targetID = *task.TargetSlideID
+		} else if s, ok := task.Payload["slideId"].(string); ok {
+			targetID = s
+		}
+		slideIdx := -1
+		for i := range project.Slides {
+			if project.Slides[i].ID == targetID {
+				slideIdx = i
+				break
+			}
+		}
+		if slideIdx < 0 {
+			return "", errors.New("页面不存在")
+		}
+		instruction, _ := task.Payload["instruction"].(string)
+		var sel model.RegionSelection
+		if rawSel, ok := task.Payload["selection"]; ok && rawSel != nil {
+			b, _ := json.Marshal(rawSel)
+			_ = json.Unmarshal(b, &sel)
+		}
+		if instruction == "" || sel.ImageWidth <= 0 || sel.ImageHeight <= 0 {
+			return "", errors.New("任务参数缺失（selection/instruction）")
+		}
+		baseBuf, err := aiSvc.CurrentIllustrationBuffer(ctx, project.Slides[slideIdx])
+		if err != nil || len(baseBuf) == 0 {
+			return "", errors.New("当前插图不存在（无法作为重绘底图）")
+		}
+		imgCfg, _, cfgErr := imgproc.InspectConfig(baseBuf)
+		imgW, imgH := 1280, 720
+		if cfgErr == nil && imgCfg.Width > 0 && imgCfg.Height > 0 {
+			imgW, imgH = imgCfg.Width, imgCfg.Height
+		}
+		scaleX := float64(imgW) / sel.ImageWidth
+		scaleY := float64(imgH) / sel.ImageHeight
+		pxBox := ai.RegionBox{
+			X:      math.Round(sel.X * scaleX),
+			Y:      math.Round(sel.Y * scaleY),
+			Width:  math.Round(sel.Width * scaleX),
+			Height: math.Round(sel.Height * scaleY),
+		}
+
+		candidates, err := aiSvc.GetImageClientCandidates(ctx, model.CapabilityRoleImageEdit)
+		if err != nil {
+			return "", err
+		}
+		var lastErr error
+		for _, handle := range candidates {
+			var mask []byte
+			if handle.SupportsMaskEdit {
+				mask, _ = imgproc.BuildMaskFromSelection(imgW, imgH, sel)
+			}
+			genRes, gErr := aiSvc.RegionEditWithAI(ctx, ai.RegionEditAIParams{
+				Handle:      handle,
+				BaseImage:   baseBuf,
+				Instruction: instruction,
+				Selection:   pxBox,
+				MaskImage:   mask,
+			})
+			if gErr != nil {
+				lastErr = gErr
+				if !ai.IsRetryableError(gErr) || handle.IsFallback {
+					break
+				}
+				obs.LogError("imageAi", gErr)
+				continue
+			}
+
+			noteStr, _ := task.Payload["note"].(string)
+			if noteStr == "" {
+				noteStr = "AI 重绘：" + instruction
+			}
+			projMu.Lock()
+			sl := &project.Slides[slideIdx]
+			ver, rErr := aiSvc.RecordIllustrationVersion(ctx, sl, genRes.Buffer, model.IllustrationOpAiRegionEdit, project.ID, &ai.RecordIllustrationOptions{
+				Note:      &noteStr,
+				Selection: &sel,
+			})
+			if rErr != nil {
+				projMu.Unlock()
+				return "", rErr
+			}
+			acc := 0.0
+			for _, v := range sl.Versions {
+				if v.ID == sl.CurrentVersionID {
+					acc = v.Accent
+					break
+				}
+			}
+			sid := sl.ID
+			vid := ver.ID
+			orderNum := int(sl.Order)
+			project.Versions = append(project.Versions, model.VersionSnapshot{
+				ID:                    id.GenID("ver"),
+				Index:                 float64(len(project.Versions) + 1),
+				Scope:                 model.SnapshotScopeSlide,
+				SlideID:               &sid,
+				Note:                  fmt.Sprintf("第 %d 页：%s", orderNum, noteStr),
+				CreatedAt:             store.NowISO(),
+				Accent:                acc,
+				IllustrationVersionID: &vid,
+			})
+			project.UpdatedAt = store.NowISO()
+			projMu.Unlock()
+			return fmt.Sprintf("第 %d 页 AI 重绘完成", orderNum), nil
+		}
+		if lastErr != nil {
+			return "", lastErr
+		}
+		return "", errors.New("AI 框选重绘失败")

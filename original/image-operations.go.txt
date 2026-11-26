@@ -1,0 +1,95 @@
+func scaleSelection(imgW, imgH int, sel model.RegionSelection) (left, top, regionW, regionH int) {
+	iw := sel.ImageWidth
+	if iw <= 0 {
+		iw = float64(imgW)
+	}
+	ih := sel.ImageHeight
+	if ih <= 0 {
+		ih = float64(imgH)
+	}
+	scaleX := float64(imgW) / iw
+	scaleY := float64(imgH) / ih
+	left = max(0, int(math.Round(sel.X*scaleX)))
+	top = max(0, int(math.Round(sel.Y*scaleY)))
+	if left >= imgW {
+		left = max(0, imgW-1)
+	}
+	if top >= imgH {
+		top = max(0, imgH-1)
+	}
+	regionW = min(imgW-left, max(1, int(math.Round(sel.Width*scaleX))))
+	regionH = min(imgH-top, max(1, int(math.Round(sel.Height*scaleY))))
+	return
+}
+
+// ApplyRegionOperation matches src/lib/server/imageOps.ts applyRegionOperation:
+// erase_region, region_overlay, replace_full.
+func ApplyRegionOperation(baseBytes []byte, operation string, selection *model.RegionSelection, patchBytes []byte) ([]byte, error) {
+	baseImg, cfg, _, err := Decode(baseBytes, DefaultMaxPixels)
+	if err != nil {
+		return nil, err
+	}
+	width, height := cfg.Width, cfg.Height
+	if width <= 0 {
+		width = 1280
+	}
+	if height <= 0 {
+		height = 720
+	}
+
+	if operation == "replace_full" {
+		if len(patchBytes) == 0 {
+			return nil, errors.New("replace_full 需要提供新图片")
+		}
+		patchImg, _, _, err := Decode(patchBytes, DefaultMaxPixels)
+		if err != nil {
+			return nil, err
+		}
+		return EncodePNG(ResizeCover(patchImg, width, height))
+	}
+
+	if selection == nil {
+		return nil, errors.New("该操作需要提供选区坐标")
+	}
+	left, top, regionW, regionH := scaleSelection(width, height, *selection)
+	canvas := toNRGBA(baseImg)
+	rect := image.Rect(left, top, left+regionW, top+regionH)
+
+	switch operation {
+	case "erase_region":
+		sub := image.NewNRGBA(image.Rect(0, 0, regionW, regionH))
+		draw.Draw(sub, sub.Bounds(), canvas, image.Point{X: left, Y: top}, draw.Src)
+		blurred := boxBlurNRGBA(sub, 24)
+		draw.Draw(canvas, rect, blurred, image.Point{}, draw.Src)
+		return EncodePNG(canvas)
+	case "region_overlay":
+		if len(patchBytes) == 0 {
+			return nil, errors.New("region_overlay 需要提供补丁图片")
+		}
+		patchImg, _, _, err := Decode(patchBytes, DefaultMaxPixels)
+		if err != nil {
+			return nil, err
+		}
+		patchScaled := ResizeCover(patchImg, regionW, regionH)
+		draw.Draw(canvas, rect, patchScaled, image.Point{}, draw.Over)
+		return EncodePNG(canvas)
+	default:
+		return nil, fmt.Errorf("未知区域操作：%s", operation)
+	}
+}
+
+// BuildMaskFromSelection matches src/lib/server/imageOps.ts buildMaskFromSelection:
+// black background, white rectangle on selected region.
+func BuildMaskFromSelection(imageWidth, imageHeight int, selection model.RegionSelection) ([]byte, error) {
+	if imageWidth <= 0 {
+		imageWidth = 1280
+	}
+	if imageHeight <= 0 {
+		imageHeight = 720
+	}
+	left, top, w, h := scaleSelection(imageWidth, imageHeight, selection)
+	mask := image.NewNRGBA(image.Rect(0, 0, imageWidth, imageHeight))
+	draw.Draw(mask, mask.Bounds(), &image.Uniform{C: color.NRGBA{R: 0, G: 0, B: 0, A: 255}}, image.Point{}, draw.Src)
+	draw.Draw(mask, image.Rect(left, top, left+w, top+h), &image.Uniform{C: color.NRGBA{R: 255, G: 255, B: 255, A: 255}}, image.Point{}, draw.Src)
+	return EncodePNG(mask)
+}

@@ -1,0 +1,231 @@
+func (s *Server) handleRegionEdit(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	user, err := s.auth.RequireUser(ctx, r)
+	if err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	projectID := r.PathValue("id")
+	slideID := r.PathValue("slideId")
+	if err := r.ParseMultipartForm(16 << 20); err != nil {
+		httpx.WriteError(w, httpx.BadRequest("请求格式错误"))
+		return
+	}
+	operation := model.IllustrationOperation(r.FormValue("operation"))
+	switch operation {
+	case model.IllustrationOpEraseRegion, model.IllustrationOpRegionOverlay, model.IllustrationOpReplaceFull, model.IllustrationOpAiRegionEdit:
+	default:
+		httpx.WriteError(w, httpx.BadRequest("operation 参数不合法"))
+		return
+	}
+
+	var selection *model.RegionSelection
+	if rawSel := r.FormValue("selection"); rawSel != "" {
+		var sel model.RegionSelection
+		if err := json.Unmarshal([]byte(rawSel), &sel); err != nil {
+			httpx.WriteError(w, httpx.BadRequest("selection 不是合法 JSON"))
+			return
+		}
+		selection = &sel
+	}
+	instruction := strings.TrimSpace(r.FormValue("instruction"))
+	note := strings.TrimSpace(r.FormValue("note"))
+
+	if operation == model.IllustrationOpAiRegionEdit {
+		if selection == nil {
+			httpx.WriteError(w, httpx.BadRequest("生成式框选重绘需要提供 selection 选区坐标"))
+			return
+		}
+		if instruction == "" {
+			httpx.WriteError(w, httpx.BadRequest("请填写这个区域要修改成什么样子的文字指令"))
+			return
+		}
+		cfg, _ := s.store.GetPricingConfig(ctx)
+		wallet, wErr := s.store.GetWalletSummary(ctx, user.ID)
+		if wErr != nil {
+			httpx.WriteError(w, wErr)
+			return
+		}
+		outTask, _, tErr := store.MutateOwnedProjectWithTaskResult(
+			ctx,
+			s.store,
+			user,
+			projectID,
+			func(project *model.Project, hasRunningTask func(kind model.TaskKind) *model.AiTask) (store.OwnedProjectTaskPlan[model.AiTask], error) {
+				var target *model.Slide
+				for i := range project.Slides {
+					if project.Slides[i].ID == slideID {
+						target = &project.Slides[i]
+						break
+					}
+				}
+				if target == nil {
+					return store.OwnedProjectTaskPlan[model.AiTask]{}, errors.New("页面不存在")
+				}
+				if hasRunningTask(model.TaskKindFullGenerate) != nil {
+					return store.OwnedProjectTaskPlan[model.AiTask]{}, errors.New("整套生成进行中，请等全部页面生成完成后再修改单页")
+				}
+				quote, qErr := store.BuildQuote(&cfg, wallet.Total, store.QuoteOpts{Action: "region_ai_edit", PageCount: 1}, time.Now())
+				if qErr != nil {
+					return store.OwnedProjectTaskPlan[model.AiTask]{}, qErr
+				}
+				if quote.TotalCreditCost > quote.CurrentBalance {
+					return store.OwnedProjectTaskPlan[model.AiTask]{}, fmt.Errorf(
+						"Credits 余额不足：AI 框选重绘需要 %v Credits（当前余额 %v）",
+						quote.TotalCreditCost, quote.CurrentBalance,
+					)
+				}
+				project.UpdatedAt = store.NowISO()
+				pid := project.ID
+				pname := project.Name
+				sid := target.ID
+				payload := map[string]any{
+					"slideId":     sid,
+					"selection":   selection,
+					"instruction": instruction,
+					"unitCost":    quote.UnitCreditCost,
+				}
+				if note != "" {
+					payload["note"] = note
+				}
+				newTask := tasks.BuildTask(tasks.CreateTaskOpts{
+					UserID:        user.ID,
+					Kind:          model.TaskKindRegionEdit,
+					Label:         fmt.Sprintf("第 %d 页：AI 生成式重绘", int(target.Order)),
+					ProjectID:     &pid,
+					ProjectName:   &pname,
+					TargetSlideID: &sid,
+					Steps:         tasks.MakeSteps([]string{"等待计算节点领取", "正在生成式重绘选区", "正在落盘新版本"}, 900),
+					Payload:       payload,
+				})
+				return store.OwnedProjectTaskPlan[model.AiTask]{
+					Result: newTask,
+					Task:   &newTask,
+					Billing: &store.ProjectTaskBilling{
+						Amount:   quote.TotalCreditCost,
+						UnitCost: quote.UnitCreditCost,
+						Action:   "region_ai_edit",
+					},
+				}, nil
+			},
+		)
+		if tErr != nil {
+			httpx.WriteError(w, tErr)
+			return
+		}
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"task": outTask})
+		return
+	}
+
+	var patchBytes []byte
+	if pf, _, pErr := r.FormFile("patch"); pErr == nil && pf != nil {
+		patchBytes, _ = io.ReadAll(io.LimitReader(pf, 16<<20))
+		_ = pf.Close()
+	}
+	if (operation == model.IllustrationOpRegionOverlay || operation == model.IllustrationOpReplaceFull) && len(patchBytes) == 0 {
+		httpx.WriteError(w, httpx.BadRequest("该操作需要上传补丁/替换图片"))
+		return
+	}
+	if (operation == model.IllustrationOpEraseRegion || operation == model.IllustrationOpRegionOverlay) && selection == nil {
+		httpx.WriteError(w, httpx.BadRequest("该操作需要提供 selection 选区坐标"))
+		return
+	}
+
+	proj, err := s.getOwnedProject(r, user, projectID)
+	if err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	var targetSlide *model.Slide
+	for i := range proj.Slides {
+		if proj.Slides[i].ID == slideID {
+			targetSlide = &proj.Slides[i]
+			break
+		}
+	}
+	if targetSlide == nil {
+		httpx.WriteError(w, httpx.BadRequest("页面不存在"))
+		return
+	}
+
+	baseBuf, _ := s.ai.CurrentIllustrationBuffer(ctx, *targetSlide)
+	if len(baseBuf) == 0 {
+		acc := 0
+		for _, v := range targetSlide.Versions {
+			if v.ID == targetSlide.CurrentVersionID {
+				acc = int(v.Accent)
+				break
+			}
+		}
+		baseBuf, err = imgproc.RenderSlidePlaceholderPNG(acc, string(targetSlide.Role), targetSlide.Title, targetSlide.Bullets)
+		if err != nil {
+			httpx.WriteError(w, err)
+			return
+		}
+	}
+	resBuf, err := imgproc.ApplyRegionOperation(baseBuf, string(operation), selection, patchBytes)
+	if err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+
+	effNote := note
+	if effNote == "" {
+		effNote = instruction
+	}
+	if effNote == "" {
+		effNote = defaultRegionNote(operation)
+	}
+
+	var outSlide model.Slide
+	var outVer model.IllustrationVersion
+	updatedProj, err := s.store.MutateOwnedProject(ctx, user, projectID, func(p *model.Project) error {
+		idx := -1
+		for i := range p.Slides {
+			if p.Slides[i].ID == slideID {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			return errors.New("页面不存在")
+		}
+		sl := &p.Slides[idx]
+		ver, rErr := s.ai.RecordIllustrationVersion(ctx, sl, resBuf, operation, p.ID, &ai.RecordIllustrationOptions{
+			Note:      &effNote,
+			Selection: selection,
+		})
+		if rErr != nil {
+			return rErr
+		}
+		acc := 0.0
+		for _, v := range sl.Versions {
+			if v.ID == sl.CurrentVersionID {
+				acc = v.Accent
+				break
+			}
+		}
+		sid := sl.ID
+		vid := ver.ID
+		p.Versions = append(p.Versions, model.VersionSnapshot{
+			ID:                    id.GenID("ver"),
+			Index:                 float64(len(p.Versions) + 1),
+			Scope:                 model.SnapshotScopeSlide,
+			SlideID:               &sid,
+			Note:                  fmt.Sprintf("第 %d 页：%s", int(sl.Order), effNote),
+			CreatedAt:             store.NowISO(),
+			Accent:                acc,
+			IllustrationVersionID: &vid,
+		})
+		p.UpdatedAt = store.NowISO()
+		outSlide = *sl
+		outVer = ver
+		return nil
+	})
+	if err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	s.prewarm.Observe(updatedProj)
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"slide": outSlide, "version": outVer})
+}

@@ -1,0 +1,56 @@
+// RegionEditAIParams mirrors RegionEditAiParams in src/lib/server/imageGen.ts.
+type RegionEditAIParams struct {
+	Handle      ImageClientHandle
+	BaseImage   []byte
+	Instruction string
+	Selection   RegionBox
+	MaskImage   []byte
+}
+
+// RegionEditWithAI performs generative region editing via Mode A (/images/edits with base.png + mask.png)
+// when Handle.SupportsMaskEdit && len(MaskImage) > 0, or Mode B (whole-slide reference fallback),
+// matching regionEditWithAi() in src/lib/server/imageGen.ts.
+func (s *Service) RegionEditWithAI(ctx context.Context, params RegionEditAIParams) (GenerateImageResult, error) {
+	if params.Handle.SupportsMaskEdit && len(params.MaskImage) > 0 {
+		return s.runPooledImageRequest(ctx, params.Handle, func(cctx context.Context, lease *ImageKeyLease, fmtMode model.ResponseFormat, timeout time.Duration) ([]byte, error) {
+			ext := parseCustomHTTPExtra(lease.Provider)
+			bodyBytes, ct, err := buildMultipartImageEditBody(map[string]string{
+				"model":           params.Handle.Model,
+				"prompt":          params.Instruction,
+				"response_format": string(fmtMode),
+			}, []multipartFileSpec{
+				{
+					fieldName: "image",
+					fileName:  "base.png",
+					mime:      "image/png",
+					data:      params.BaseImage,
+				},
+				{
+					fieldName: "mask",
+					fileName:  "mask.png",
+					mime:      "image/png",
+					data:      params.MaskImage,
+				},
+			})
+			if err != nil {
+				return nil, err
+			}
+			targetURL := endpointURL(lease.BaseURL, lease.Provider, "/images/edits", ext.EditPath)
+			return s.doRawImagePost(cctx, lease.Provider, lease.APIKey, targetURL, bodyBytes, ct, timeout)
+		})
+	}
+
+	fallbackPrompt := fmt.Sprintf(
+		"仅修改图片中位于坐标 (x=%s, y=%s, width=%s, height=%s) 的区域：%s。其余区域必须与原图保持完全一致，不要改变整体版式、字体风格与配色。",
+		formatJSNumber(params.Selection.X),
+		formatJSNumber(params.Selection.Y),
+		formatJSNumber(params.Selection.Width),
+		formatJSNumber(params.Selection.Height),
+		params.Instruction,
+	)
+	return s.GenerateImage(ctx, GenerateImageParams{
+		Handle:          params.Handle,
+		Prompt:          fallbackPrompt,
+		ReferenceImages: []string{ToDataURI(params.BaseImage, "image/png")},
+	})
+}
